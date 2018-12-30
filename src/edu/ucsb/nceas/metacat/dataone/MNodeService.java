@@ -94,6 +94,7 @@ import org.dataone.service.mn.tier4.v2.MNReplication;
 import org.dataone.service.mn.v2.MNPackage;
 import org.dataone.service.mn.v2.MNQuery;
 import org.dataone.service.mn.v2.MNView;
+import org.dataone.service.types.v1.AccessPolicy;
 import org.dataone.service.types.v1.AccessRule;
 import org.dataone.service.types.v1.Checksum;
 import org.dataone.service.types.v1.DescribeResponse;
@@ -217,6 +218,7 @@ public class MNodeService extends D1NodeService
     
     // shared executor
     private static ExecutorService executor = null;
+    private boolean needSync = true;
 
     static {
         // use a shared executor service with nThreads == one less than available processors
@@ -246,6 +248,13 @@ public class MNodeService extends D1NodeService
         
         // set the Member Node certificate file location
         CertificateManager.getInstance().setCertificateLocation(Settings.getConfiguration().getString("D1Client.certificate.file"));
+
+        try {
+            needSync = (new Boolean(PropertyService.getProperty("dataone.nodeSynchronize"))).booleanValue();
+        } catch (PropertyNotFoundException e) {
+            // TODO Auto-generated catch block
+            logMetacat.warn("MNodeService.constructor : can't find the property to indicate if the memeber node need to be synchronized. It will use the default value - true.");
+        }
     }
 
     /**
@@ -634,10 +643,12 @@ public class MNodeService extends D1NodeService
         if (session == null) {
           throw new InvalidToken("1110", "Session is required to WRITE to the Node.");
         }
+        
         // verify the pid is valid format
         if (!isValidIdentifier(pid)) {
             throw new InvalidRequest("1102", "The provided identifier is invalid.");
         }
+        objectExists(pid);
         // set the submitter to match the certificate
         sysmeta.setSubmitter(session.getSubject());
         // set the originating node
@@ -689,9 +700,9 @@ public class MNodeService extends D1NodeService
             if (idExists) {
                     throw new InvalidSystemMetadata("1180", 
                               "The series identifier " + sid.getValue() +
-                              " is already used by another object and" +
+                              " is already used by another object and " +
                               "therefore can not be used for this object. Clients should choose" +
-                              "a new identifier that is unique and retry the operation or " +
+                              " a new identifier that is unique and retry the operation or " +
                               "use CN.reserveIdentifier() to reserve one.");
                 
             }
@@ -700,6 +711,20 @@ public class MNodeService extends D1NodeService
                 throw new InvalidSystemMetadata("1180", "The series id "+sid.getValue()+" in the system metadata shouldn't have the same value of the pid.");
             }
         }
+        
+        boolean allowed = false;
+        try {
+          allowed = isAuthorized(session, pid, Permission.WRITE);
+                
+        } catch (NotFound e) {
+          // The identifier doesn't exist, writing should be fine.
+          allowed = true;
+        }
+        
+        if(!allowed) {
+            throw new NotAuthorized("1100", "Provited Identity doesn't have the WRITE permission on the pid "+pid.getValue());
+        }
+        logMetacat.debug("Allowed to create: " + pid.getValue());
 
         // call the shared impl
         Identifier resultPid = super.create(session, pid, object, sysmeta);
@@ -755,6 +780,8 @@ public class MNodeService extends D1NodeService
                             sysmeta.getIdentifier().getValue()                    +
                             "\n" + "\tSource NodeReference ="                     +
                             sourceNode.getValue());
+        } else {
+            throw new InvalidRequest("2153", "The provided session or systemmetdata or sourceNode should NOT be null.");
         }
         boolean result = false;
         String nodeIdStr = null;
@@ -785,7 +812,13 @@ public class MNodeService extends D1NodeService
             throw new NotAuthorized("2152", msg);
             
         }
-
+       
+        // only allow cns call this method
+        boolean  allowed = isCNAdmin(session);
+        if(!allowed) {
+            throw new NotAuthorized("2152", "The client is not a coordinate node. Only a coordinate node is allowed to call the replicate method : ");
+        }
+        logMetacat.debug("Allowed to replicate: " + pid.getValue());
 
         // get the local node id
         try {
@@ -913,6 +946,7 @@ public class MNodeService extends D1NodeService
                 if ( localId == null ) {
                     // TODO: this will fail if we already "know" about the identifier
                     // FIXME: see https://redmine.dataone.org/issues/2572
+                    objectExists(pid);
                     retPid = super.create(session, pid, object, sysmeta);
                     result = (retPid.getValue().equals(pid.getValue()));
                 }
@@ -2094,6 +2128,11 @@ public class MNodeService extends D1NodeService
 				List<Identifier> dataIdentifiers = sciMetaMap.get(originalIdentifier);
 					
 				// reconstruct the ORE with the new identifiers
+				//the original identifier can be in the data object list, we should replace it if does exist.
+                if(dataIdentifiers.contains(originalIdentifier)) {
+                    dataIdentifiers.remove(originalIdentifier);
+                    dataIdentifiers.add(newIdentifier);
+                }
 				sciMetaMap.remove(originalIdentifier);
 				sciMetaMap.put(newIdentifier, dataIdentifiers);
 				
@@ -2762,6 +2801,18 @@ public class MNodeService extends D1NodeService
                       ". It doesn't match our current system metadata modification date in the member node - "+currentModiDate.toString()+
                       ". Please check if you have got the newest version of the system metadata before the modification.");
           }
+          //check the if client change the authoritative member node.
+          if (currentSysmeta.getAuthoritativeMemberNode() != null && sysmeta.getAuthoritativeMemberNode() != null && 
+                  !currentSysmeta.getAuthoritativeMemberNode().equals(sysmeta.getAuthoritativeMemberNode())) {
+              throw new InvalidRequest("4869", "Current authoriativeMemberNode is "+currentSysmeta.getAuthoritativeMemberNode().getValue()+" but the value on the new system metadata is "+sysmeta.getAuthoritativeMemberNode().getValue()+
+                      ". They don't match. Clients don't have the permission to change it.");
+          } else if (currentSysmeta.getAuthoritativeMemberNode() != null && sysmeta.getAuthoritativeMemberNode() == null) {
+              throw new InvalidRequest("4869", "Current authoriativeMemberNode is "+currentSysmeta.getAuthoritativeMemberNode().getValue()+" but the value on the new system metadata is null. They don't match. Clients don't have the permission to change it.");
+          }
+          else if(currentSysmeta.getAuthoritativeMemberNode() == null && sysmeta.getAuthoritativeMemberNode() != null ) {
+              throw new InvalidRequest("4869", "Current authoriativeMemberNode is null but the value on the new system metadata is not null. They don't match. Clients don't have the permission to change it.");
+          }
+          checkAddRestrictiveAccessOnDOI(sysmeta);
           boolean needUpdateModificationDate = true;
           boolean fromCN = false;
           success = updateSystemMetadata(session, pid, sysmeta, needUpdateModificationDate, currentSysmeta, fromCN);
@@ -2769,7 +2820,8 @@ public class MNodeService extends D1NodeService
           HazelcastService.getInstance().getSystemMetadataMap().unlock(pid);
       }
       
-      if(success) {
+      if(success && needSync) {
+          logMetacat.debug("MNodeService.updateSystemMetadata - the cn needs to be notified that the system metadata of object " +pid.getValue()+" has been changed ");
           this.cn = D1Client.getCN();
           //TODO
           //notify the cns the synchornize the new system metadata.
@@ -2823,6 +2875,56 @@ public class MNodeService extends D1NodeService
       }
       return success;
     }
+	
+	/**
+	 * Check if the new system meta data removed the public-readable access rule for an DOI object ( DOI can be in the identifier or sid fields)
+	 * @param newSysMeta
+	 * @throws InvalidRequest
+	 */
+	private void checkAddRestrictiveAccessOnDOI(SystemMetadata newSysMeta)  throws InvalidRequest {
+	    String doi ="doi:";
+	    boolean identifierIsDOI = false;
+        boolean sidIsDOI = false;
+        if(newSysMeta.getIdentifier() == null) {
+            throw new InvalidRequest("4869", "In the MN.updateSystemMetadata method, the identifier shouldn't be null in the new version system metadata ");
+        }
+        String identifier = newSysMeta.getIdentifier().getValue();
+        String sid = null;
+        if(newSysMeta.getSeriesId() != null) {
+            sid = newSysMeta.getSeriesId().getValue();
+        }
+        // determine if this identifier is an DOI
+        if (identifier != null && identifier.startsWith(doi)) {
+            identifierIsDOI = true;
+        }
+        // determine if this sid is an DOI
+        if (sid != null && sid.startsWith(doi)) {
+            sidIsDOI = true;
+        }
+        if(identifierIsDOI || sidIsDOI) {
+            Subject publicUser = new Subject();
+            publicUser.setValue("public");
+            AccessPolicy access = newSysMeta.getAccessPolicy();
+            if(access == null) {
+                throw new InvalidRequest("4869", "In the MN.updateSystemMetadata method, the public-readable access rule shouldn't be removed for an DOI object "+identifier+ " or SID "+sid);
+            } else {
+                boolean found = false;
+                if (access.getAllowList() != null) {
+                    for (AccessRule item : access.getAllowList()) {
+                        if(item.getSubjectList() != null && item.getSubjectList().contains(publicUser)) {
+                            if (item.getPermissionList() != null && item.getPermissionList().contains(Permission.READ)) {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if(!found) {
+                    throw new InvalidRequest("4869", "In the MN.updateSystemMetadata method, the public-readable access rule shouldn't be removed for an DOI object "+identifier+ " or SID "+sid);
+                }
+            }
+        }
+	}
 	
 	/*
      * Determine if the current node is the authoritative node for the given pid.
